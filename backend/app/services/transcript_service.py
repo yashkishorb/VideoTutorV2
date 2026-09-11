@@ -1,26 +1,19 @@
 """
 Transcript extraction service.
 
-This module is intentionally isolated from the AI layer: it knows nothing
-about Gemini. If the underlying extraction mechanism needs to change later
-(different library, an official captions API, a paid proxy to dodge IP
-blocks, etc.) only this file should need to change.
+Uses youtube-transcript.ai as the transcript source because direct
+YouTube transcript requests can be blocked when the backend runs
+from a cloud provider such as Render.
 
-Also provides a very small in-memory cache so that re-analyzing the same
-video within a process's lifetime does not repeat network calls. This is
-explicitly NOT a persistent cache -- see the module docstring in
-core/config.py for where a Redis/Postgres cache could later be added.
+The rest of the application remains independent of the transcript
+provider.
 """
+
 from dataclasses import dataclass
 from typing import List, Optional
+import re
 
 import httpx
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    NoTranscriptFound,
-    TranscriptsDisabled,
-    VideoUnavailable,
-)
 
 from app.core.logging_config import get_logger
 from app.schemas.video import TranscriptSegment
@@ -58,70 +51,183 @@ class _InMemoryTranscriptCache:
 class TranscriptService:
     def __init__(self) -> None:
         self._cache = _InMemoryTranscriptCache()
-        self._api = YouTubeTranscriptApi()
 
     def get_transcript(self, video_id: str) -> TranscriptResult:
         cached = self._cache.get(video_id)
+
         if cached is not None:
             logger.info("transcript cache hit video_id=%s", video_id)
             return cached
 
-        logger.info("transcript fetch started video_id=%s", video_id)
+        logger.info(
+            "transcript fetch started video_id=%s provider=youtube-transcript.ai",
+            video_id,
+        )
+
+        url = f"https://youtube-transcript.ai/transcript/{video_id}.txt"
+
         try:
-            transcript_list = self._api.list(video_id)
+            response = httpx.get(
+                url,
+                timeout=20.0,
+                follow_redirects=True,
+            )
 
-            # Prefer a manually created transcript, fall back to a generated
-            # one, in whatever language is available. Try English first for
-            # a stable default, otherwise take the first available.
-            transcript = None
-            try:
-                transcript = transcript_list.find_transcript(["en"])
-            except NoTranscriptFound:
-                for t in transcript_list:
-                    transcript = t
-                    break
-
-            if transcript is None:
-                raise NoTranscriptFound(video_id, [], transcript_list)
-
-            fetched = transcript.fetch()
-            segments = [
-                TranscriptSegment(start=item.start, duration=item.duration, text=item.text)
-                for item in fetched
-            ]
-            result = TranscriptResult(segments=segments, language=transcript.language_code)
-            self._cache.set(video_id, result)
             logger.info(
-                "transcript fetch succeeded video_id=%s segments=%d language=%s",
+                "transcript provider response video_id=%s status=%s",
+                video_id,
+                response.status_code,
+            )
+
+            if response.status_code == 404:
+                raise VideoUnavailableError(
+                    "The video could not be found or is unavailable."
+                )
+
+            response.raise_for_status()
+
+            text = response.text.strip()
+
+            if not text:
+                raise TranscriptUnavailableError(
+                    "The transcript returned by the provider was empty."
+                )
+
+            segments = self._parse_transcript(text)
+
+            if not segments:
+                raise TranscriptUnavailableError(
+                    "Could not parse the transcript returned by the provider."
+                )
+
+            result = TranscriptResult(
+                segments=segments,
+                language=None,
+            )
+
+            self._cache.set(video_id, result)
+
+            logger.info(
+                "transcript fetch succeeded video_id=%s segments=%d",
                 video_id,
                 len(segments),
-                transcript.language_code,
             )
+
             return result
 
-        except (TranscriptsDisabled, NoTranscriptFound) as exc:
-            logger.info("transcript unavailable video_id=%s reason=%s", video_id, type(exc).__name__)
-            raise TranscriptUnavailableError(str(exc)) from exc
-        except VideoUnavailable as exc:
-            logger.info("video unavailable video_id=%s", video_id)
-            raise VideoUnavailableError(str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - convert unknown failures to a clean error
-            logger.warning("transcript fetch failed video_id=%s error=%s", video_id, type(exc).__name__)
-            raise TranscriptUnavailableError(str(exc)) from exc
+        except (VideoUnavailableError, TranscriptUnavailableError):
+            raise
+
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "transcript provider HTTP error video_id=%s status=%s",
+                video_id,
+                exc.response.status_code,
+            )
+            raise TranscriptUnavailableError(
+                "We couldn't access a transcript for this video."
+            ) from exc
+
+        except httpx.RequestError as exc:
+            logger.warning(
+                "transcript provider request failed video_id=%s error=%s",
+                video_id,
+                type(exc).__name__,
+            )
+            raise TranscriptUnavailableError(
+                "We couldn't access a transcript for this video."
+            ) from exc
+
+        except Exception as exc:
+            logger.warning(
+                "transcript fetch failed video_id=%s error=%s",
+                video_id,
+                type(exc).__name__,
+            )
+            raise TranscriptUnavailableError(
+                "We couldn't access a transcript for this video."
+            ) from exc
+
+    @staticmethod
+    def _parse_transcript(text: str) -> List[TranscriptSegment]:
+        """
+        Parse youtube-transcript.ai timestamped transcript text.
+
+        Example:
+            [0:02] Hello everyone
+            [0:15] Welcome to the video
+        """
+
+        pattern = re.compile(
+            r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*?)(?=\n\[\d+:\d+(?:\.\d+)?\]|\Z)",
+            re.DOTALL,
+        )
+
+        matches = list(pattern.finditer(text))
+
+        segments: List[TranscriptSegment] = []
+
+        for index, match in enumerate(matches):
+            minutes = int(match.group(1))
+            seconds = float(match.group(2))
+            start = minutes * 60 + seconds
+
+            transcript_text = " ".join(
+                match.group(3).split()
+            ).strip()
+
+            if not transcript_text:
+                continue
+
+            # Calculate duration from the next timestamp.
+            if index + 1 < len(matches):
+                next_match = matches[index + 1]
+
+                next_minutes = int(next_match.group(1))
+                next_seconds = float(next_match.group(2))
+
+                next_start = next_minutes * 60 + next_seconds
+                duration = max(0.1, next_start - start)
+            else:
+                # Last segment: give it a small fallback duration.
+                duration = 2.0
+
+            segments.append(
+                TranscriptSegment(
+                    start=start,
+                    duration=duration,
+                    text=transcript_text,
+                )
+            )
+
+        return segments
 
     @staticmethod
     def fetch_video_title(video_id: str) -> Optional[str]:
-        """Best-effort title lookup via YouTube's public oEmbed endpoint (no API key required)."""
+        """
+        Best-effort title lookup via YouTube's public oEmbed endpoint.
+        No API key required.
+        """
+
         try:
             resp = httpx.get(
                 "https://www.youtube.com/oembed",
-                params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
+                params={
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "format": "json",
+                },
                 timeout=5.0,
             )
+
             if resp.status_code == 200:
                 return resp.json().get("title")
-        except Exception:  # noqa: BLE001 - title is a nice-to-have, never fatal
-            logger.info("title lookup failed video_id=%s", video_id)
+
+        except Exception:
+            logger.info(
+                "title lookup failed video_id=%s",
+                video_id,
+            )
+
         return None
 
 
