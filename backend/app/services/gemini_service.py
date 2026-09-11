@@ -167,6 +167,11 @@ class GeminiService:
                     max_output_tokens=2048,
                 ),
             )
+            logger.info(
+                "gemini raw response candidates=%s prompt_feedback=%s",
+                len(response.candidates or []),
+                response.prompt_feedback,
+            )
         except ClientError as exc:
             status = getattr(exc, "code", None)
             if status == 429:
@@ -181,11 +186,80 @@ class GeminiService:
             logger.warning("gemini unexpected error video_id=%s error=%s", video_id, type(exc).__name__)
             raise GeminiServiceError("Something went wrong while contacting the AI tutor.") from exc
 
-        answer = (response.text or "").strip()
+               # Extract text safely from the response parts.
+        # response.text is a convenience accessor, but some Gemini
+        # responses may contain candidates/parts without a usable .text.
+        answer_parts: list[str] = []
+
+        try:
+            for candidate in response.candidates or []:
+                if not candidate.content:
+                    continue
+
+                for part in candidate.content.parts or []:
+                    if part.text and not getattr(part, "thought", False):
+                        answer_parts.append(part.text)
+
+        except Exception as exc:
+            logger.warning(
+                "failed to extract Gemini response parts video_id=%s error=%s",
+                video_id,
+                type(exc).__name__,
+            )
+
+        answer = "\n".join(answer_parts).strip()
+
+        # Fallback to the SDK convenience accessor.
         if not answer:
+            try:
+                answer = (response.text or "").strip()
+            except Exception as exc:
+                logger.warning(
+                    "Gemini response.text extraction failed video_id=%s error=%s",
+                    video_id,
+                    type(exc).__name__,
+                )
+
+        if not answer:
+            # Log useful diagnostic information without exposing secrets.
+            try:
+                candidate_info = []
+
+                for candidate in response.candidates or []:
+                    candidate_info.append(
+                        {
+                            "finish_reason": str(candidate.finish_reason),
+                            "has_content": candidate.content is not None,
+                            "parts_count": (
+                                len(candidate.content.parts)
+                                if candidate.content and candidate.content.parts
+                                else 0
+                            ),
+                        }
+                    )
+
+                logger.warning(
+                    "Gemini returned no text video_id=%s candidates=%s prompt_feedback=%s",
+                    video_id,
+                    candidate_info,
+                    response.prompt_feedback,
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "could not inspect empty Gemini response video_id=%s error=%s",
+                    video_id,
+                    type(exc).__name__,
+                )
+
             raise GeminiServiceError("The AI tutor returned an empty response.")
 
-        logger.info("gemini request succeeded video_id=%s answer_length=%d", video_id, len(answer))
+        logger.info(
+            "gemini request succeeded video_id=%s answer_length=%d",
+            video_id,
+            len(answer),
+        )
+
         return answer
 
 
